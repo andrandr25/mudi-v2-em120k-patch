@@ -1,0 +1,10 @@
+--- a/usr/bin/tuning_switch_control
++++ b/usr/bin/tuning_switch_control
+@@ -15,6 +15,7 @@
+ done
+ 
+ case $version in
++    *EM120KGL*|\
+     *EM060KGL*|\
+     *EM05*)
+         band_info=`gl_modem -B $bus AT 'AT+QENG="servingcell"' | awk -F "," '{print $3}'`

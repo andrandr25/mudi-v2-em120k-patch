@@ -1,0 +1,5 @@
+/usr/bin/em120k-fix
+/etc/init.d/em120k-fix
+/etc/hotplug.d/usb/25_em120k_fix.sh
+/etc/em120k-fix/
+/lib/upgrade/keep.d/em120k-fix

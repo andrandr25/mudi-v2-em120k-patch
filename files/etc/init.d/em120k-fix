@@ -1,0 +1,15 @@
+#!/bin/sh /etc/rc.common
+# OpenWrt init script for Quectel EM120K-GL on GL.iNet GL-E750 V2 (Mudi V2)
+# Runs right after S19modem-init so modem_AT is already listening.
+
+START=20
+STOP=90
+
+start() {
+    [ -x /usr/bin/em120k-fix ] || return 0
+    (sleep 6; /usr/bin/em120k-fix apply --no-verify >/dev/null 2>&1) &
+}
+
+stop() {
+    return 0
+}

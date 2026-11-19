@@ -1,0 +1,525 @@
+#!/bin/sh
+# em120k-fix: Quectel EM120K-GL enablement & recovery utility for GL.iNet GL-E750 V2 (Mudi V2)
+# Compatible with OpenWrt 22.03 (BusyBox ash) and GL.iNet SDK 4.8.x
+
+PATH="${PATH:+${PATH}:}/usr/sbin:/usr/bin:/sbin:/bin"
+
+MODEM_SH="${EM120K_MODEM_SH:-/lib/functions/modem.sh}"
+SYSFS_USB="${EM120K_SYSFS_USB:-/sys/bus/usb}"
+SYSFS_NET="${EM120K_SYSFS_NET:-/sys/class/net}"
+SYSFS_DEVICES="${EM120K_SYSFS_DEVICES:-/sys/devices}"
+DEV_ROOT="${EM120K_DEV_ROOT:-/dev}"
+PROC_GL_MODEM="${EM120K_PROC_GL_MODEM:-/proc/gl-hw-info/build-in-modem}"
+LOCK_DIR="${EM120K_LOCK_DIR:-/var/lock/em120k-fix.lock}"
+DIAG_FILE="${EM120K_DIAG_FILE:-/tmp/em120k-diag.log}"
+WAIT_AT_SECS="${EM120K_WAIT_AT_SECS:-30}"
+WAIT_REENUM_SECS="${EM120K_WAIT_REENUM_SECS:-45}"
+WAIT_IP_SECS="${EM120K_WAIT_IP_SECS:-20}"
+SLEEP_CMD="${EM120K_SLEEP_CMD:-sleep}"
+
+if [ -f "$MODEM_SH" ]; then
+    # shellcheck disable=SC1090
+    . "$MODEM_SH"
+fi
+
+log_msg() {
+    local level="$1"
+    shift
+    local msg="$*"
+    printf '[em120k-fix][%s] %s\n' "$level" "$msg"
+    if command -v logger >/dev/null 2>&1; then
+        logger -t "em120k-fix" -p "daemon.${level}" "$msg" 2>/dev/null || true
+    fi
+}
+
+log_info() { log_msg "info" "$*"; }
+log_warn() { log_msg "warn" "$*"; }
+log_err()  { log_msg "err" "$*"; }
+
+acquire_lock() {
+    mkdir -p "$(dirname "$LOCK_DIR")" 2>/dev/null || true
+    if mkdir "$LOCK_DIR" 2>/dev/null; then
+        echo "$$" > "$LOCK_DIR/pid"
+        trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+        return 0
+    fi
+    if [ -f "$LOCK_DIR/pid" ]; then
+        local old_pid
+        old_pid="$(cat "$LOCK_DIR/pid" 2>/dev/null)"
+        if [ -n "$old_pid" ] && ! kill -0 "$old_pid" 2>/dev/null; then
+            rm -rf "$LOCK_DIR"
+            if mkdir "$LOCK_DIR" 2>/dev/null; then
+                echo "$$" > "$LOCK_DIR/pid"
+                trap 'rm -rf "$LOCK_DIR"' EXIT INT TERM
+                return 0
+            fi
+        fi
+    fi
+    return 1
+}
+
+resolve_modem_bus() {
+    local bus=""
+    if command -v get_modem_bus >/dev/null 2>&1; then
+        bus="$(get_modem_bus 2>/dev/null | tr -d ' \r\n')"
+    fi
+    if [ -z "$bus" ] && [ -f "$PROC_GL_MODEM" ]; then
+        bus="$(cut -d ',' -f 1 "$PROC_GL_MODEM" 2>/dev/null | tr -d ' \r\n')"
+    fi
+    if [ -z "$bus" ]; then
+        bus="1-1.2"
+    fi
+    printf '%s\n' "$bus"
+}
+
+resolve_modem_iface() {
+    local bus="$1"
+    local iface=""
+    if command -v get_modem_iface >/dev/null 2>&1; then
+        iface="$(get_modem_iface "$bus" 2>/dev/null | tr -d ' \r\n')"
+    fi
+    if [ -z "$iface" ]; then
+        iface="modem_$(printf '%s' "$bus" | sed 's/-/_/g; s/\./_/g')"
+    fi
+    printf '%s\n' "$iface"
+}
+
+send_at() {
+    local bus="$1"
+    local cmd="$2"
+    gl_modem -B "$bus" AT "$cmd" 2>/dev/null
+}
+
+wait_for_at() {
+    local bus="$1"
+    local max_secs="$2"
+    local elapsed=0
+    while [ "$elapsed" -lt "$max_secs" ]; do
+        if send_at "$bus" "AT" | grep -q "OK"; then
+            return 0
+        fi
+        "$SLEEP_CMD" 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+find_cdc_wdm_for_bus() {
+    local bus="$1"
+    local devpath=""
+    local cdc_path=""
+    if [ -d "$SYSFS_USB/devices/$bus" ]; then
+        cdc_path="$(find "$SYSFS_USB/devices/$bus/" -name 'cdc-wdm*' 2>/dev/null | head -n 1)"
+    fi
+    if [ -z "$cdc_path" ] && [ -d "$SYSFS_DEVICES" ]; then
+        devpath="$(find "$SYSFS_DEVICES" -name "$bus" 2>/dev/null | head -n 1)"
+        if [ -n "$devpath" ]; then
+            cdc_path="$(find "$devpath" -name 'cdc-wdm*' 2>/dev/null | head -n 1)"
+        fi
+    fi
+    if [ -n "$cdc_path" ]; then
+        printf '%s/%s\n' "$DEV_ROOT" "$(basename "$cdc_path")"
+        return 0
+    fi
+    if [ -c "$DEV_ROOT/cdc-wdm0" ]; then
+        printf '%s/cdc-wdm0\n' "$DEV_ROOT"
+        return 0
+    fi
+    return 1
+}
+
+find_qmi_node_for_bus() {
+    local bus="$1"
+    local cdc_path=""
+    local iface_dir=""
+    if [ -d "$SYSFS_USB/devices/$bus" ]; then
+        cdc_path="$(find "$SYSFS_USB/devices/$bus/" -name 'cdc-wdm*' 2>/dev/null | head -n 1)"
+        if [ -n "$cdc_path" ]; then
+            iface_dir="$(printf '%s' "$cdc_path" | sed -n "s|.*/\(${bus}:[^/]*\)/.*|\1|p")"
+            if [ -n "$iface_dir" ]; then
+                printf '%s\n' "$iface_dir"
+                return 0
+            fi
+        fi
+    fi
+    printf '%s:1.4\n' "$bus"
+}
+
+find_wwan_ifname() {
+    local bus="$1"
+    local net_path=""
+    if [ -d "$SYSFS_USB/devices/$bus" ]; then
+        net_path="$(find "$SYSFS_USB/devices/$bus/" -path '*/net/wwan*' 2>/dev/null | head -n 1)"
+        if [ -n "$net_path" ]; then
+            basename "$net_path"
+            return 0
+        fi
+    fi
+    if [ -d "$SYSFS_NET/wwan0" ]; then
+        printf 'wwan0\n'
+        return 0
+    fi
+    return 1
+}
+
+wait_for_qmi_device() {
+    local bus="$1"
+    local max_secs="$2"
+    local elapsed=0
+    local cdc_dev=""
+    local wwan_if=""
+    while [ "$elapsed" -lt "$max_secs" ]; do
+        cdc_dev="$(find_cdc_wdm_for_bus "$bus" 2>/dev/null || true)"
+        wwan_if="$(find_wwan_ifname "$bus" 2>/dev/null || true)"
+        if [ -n "$cdc_dev" ] && [ -n "$wwan_if" ]; then
+            return 0
+        fi
+        "$SLEEP_CMD" 2
+        elapsed=$((elapsed + 2))
+    done
+    return 1
+}
+
+ensure_qmi_driver_bound() {
+    local bus="$1"
+    local vid=""
+    local pid=""
+
+    if find_cdc_wdm_for_bus "$bus" >/dev/null 2>&1; then
+        return 0
+    fi
+
+    if command -v modprobe >/dev/null 2>&1; then
+        modprobe qmi_wwan 2>/dev/null || true
+    fi
+
+    if [ -f "$SYSFS_USB/devices/$bus/idVendor" ] && [ -f "$SYSFS_USB/devices/$bus/idProduct" ]; then
+        vid="$(cat "$SYSFS_USB/devices/$bus/idVendor" 2>/dev/null | tr -d ' \r\n')"
+        pid="$(cat "$SYSFS_USB/devices/$bus/idProduct" 2>/dev/null | tr -d ' \r\n')"
+        if [ -n "$vid" ] && [ -n "$pid" ] && [ -w "$SYSFS_USB/drivers/qmi_wwan/new_id" ]; then
+            log_info "Attempting dynamic qmi_wwan bind for USB ${vid}:${pid}"
+            printf '%s %s\n' "$vid" "$pid" > "$SYSFS_USB/drivers/qmi_wwan/new_id" 2>/dev/null || true
+            "$SLEEP_CMD" 2
+        fi
+    fi
+
+    find_cdc_wdm_for_bus "$bus" >/dev/null 2>&1
+}
+
+ensure_usbnet_qmi() {
+    local bus="$1"
+    local resp=""
+    local cur_mode=""
+
+    resp="$(send_at "$bus" 'AT+QCFG="usbnet"')"
+    cur_mode="$(printf '%s\n' "$resp" | grep '+QCFG: "usbnet"' | awk -F ',' '{print $2}' | tr -cd '0-9')"
+
+    if [ -z "$cur_mode" ]; then
+        log_warn "Could not read AT+QCFG=\"usbnet\" (response: $(printf '%s' "$resp" | tr '\r\n' ' '))"
+        return 0
+    fi
+
+    log_info "Current AT+QCFG=\"usbnet\" mode: $cur_mode (0=RmNet/QMI, 1=ECM, 2=MBIM, 3=RNDIS)"
+
+    if [ "$cur_mode" != "0" ]; then
+        log_info "Switching modem from usbnet=$cur_mode to usbnet=0 (RmNet/QMI) for Mudi V2 qmi_wwan..."
+        if ! send_at "$bus" 'AT+QCFG="usbnet",0' | grep -q "OK"; then
+            log_err "Failed to set AT+QCFG=\"usbnet\",0"
+            return 1
+        fi
+        log_info "Rebooting modem (AT+CFUN=1,1) to apply RmNet/QMI USB composition..."
+        send_at "$bus" 'AT+CFUN=1,1' >/dev/null 2>&1 || true
+        "$SLEEP_CMD" 6
+
+        if ! wait_for_at "$bus" "$WAIT_REENUM_SECS"; then
+            log_warn "Modem AT port did not return within ${WAIT_REENUM_SECS}s after reboot"
+        fi
+        if ! wait_for_qmi_device "$bus" "$WAIT_REENUM_SECS"; then
+            log_warn "QMI device (/dev/cdc-wdm* + wwan*) not yet visible after reboot"
+        else
+            log_info "Modem re-enumerated successfully in RmNet/QMI mode"
+        fi
+    fi
+    return 0
+}
+
+ensure_rf_and_fcc_unlock() {
+    local bus="$1"
+    local cdc_dev="$2"
+    local cfun=""
+
+    cfun="$(send_at "$bus" 'AT+CFUN?' | grep '+CFUN:' | cut -d ':' -f 2 | tr -cd '0-9')"
+    log_info "Current AT+CFUN? state: ${cfun:-unknown}"
+
+    if [ "$cfun" != "1" ]; then
+        log_warn "Modem RF is not in full functionality mode (CFUN=${cfun:-unknown}); attempting FCC unlock & RF enable..."
+        if [ -n "$cdc_dev" ] && command -v uqmi >/dev/null 2>&1; then
+            log_info "Running uqmi --fcc-auth on $cdc_dev"
+            uqmi -t 3000 -d "$cdc_dev" --fcc-auth >/dev/null 2>&1 || true
+            uqmi -t 3000 -d "$cdc_dev" --set-device-operating-mode online >/dev/null 2>&1 || true
+        fi
+        send_at "$bus" 'AT+CFUN=1' >/dev/null 2>&1 || true
+        "$SLEEP_CMD" 3
+        cfun="$(send_at "$bus" 'AT+CFUN?' | grep '+CFUN:' | cut -d ':' -f 2 | tr -cd '0-9')"
+        if [ "$cfun" = "1" ]; then
+            log_info "RF enabled successfully (CFUN=1)"
+        else
+            log_err "Modem remains in CFUN=${cfun:-unknown}. Check hardware W_DISABLE# pin or OEM-specific FCC lock."
+            return 1
+        fi
+    fi
+
+    # Ensure MBN auto-selection is enabled so carrier profiles load cleanly
+    local mbn_auto=""
+    mbn_auto="$(send_at "$bus" 'AT+QMBNCFG="AutoSel"' | grep '+QMBNCFG: "AutoSel"' | awk -F ',' '{print $2}' | tr -cd '0-9')"
+    if [ "$mbn_auto" = "0" ]; then
+        log_info "Enabling AT+QMBNCFG=\"AutoSel\",1 for automatic carrier profile selection"
+        send_at "$bus" 'AT+QMBNCFG="AutoSel",1' >/dev/null 2>&1 || true
+    fi
+
+    return 0
+}
+
+ensure_raw_ip() {
+    local cdc_dev="$1"
+    local wwan_if="$2"
+    local dataformat=""
+
+    if [ -z "$cdc_dev" ] || [ -z "$wwan_if" ]; then
+        return 0
+    fi
+
+    if [ -f "$SYSFS_NET/$wwan_if/qmi/raw_ip" ] && command -v uqmi >/dev/null 2>&1; then
+        dataformat="$(uqmi -t 3000 -s -d "$cdc_dev" --wda-get-data-format 2>/dev/null || true)"
+        if [ "$dataformat" = '"raw-ip"' ]; then
+            local cur_raw=""
+            cur_raw="$(cat "$SYSFS_NET/$wwan_if/qmi/raw_ip" 2>/dev/null | tr -d ' \r\n')"
+            if [ "$cur_raw" != "Y" ]; then
+                log_info "Setting $wwan_if raw_ip=Y"
+                if command -v ip >/dev/null 2>&1; then
+                    ip link set dev "$wwan_if" down 2>/dev/null || true
+                fi
+                printf 'Y\n' > "$SYSFS_NET/$wwan_if/qmi/raw_ip" 2>/dev/null || true
+            fi
+        fi
+    fi
+}
+
+reconcile_uci_and_connect() {
+    local bus="$1"
+    local iface="$2"
+    local cdc_dev="$3"
+    local qmi_node="$4"
+    local changed=0
+
+    if ! command -v uci >/dev/null 2>&1; then
+        log_warn "uci not available; skipping network config reconciliation"
+        return 0
+    fi
+
+    local existing_proto=""
+    existing_proto="$(uci -q get "network.${iface}.proto" 2>/dev/null || true)"
+
+    if [ -n "$existing_proto" ]; then
+        local cur_dev=""
+        local cur_node=""
+        local cur_disabled=""
+        cur_dev="$(uci -q get "network.${iface}.device" 2>/dev/null || true)"
+        cur_node="$(uci -q get "network.${iface}.node" 2>/dev/null || true)"
+        cur_disabled="$(uci -q get "network.${iface}.disabled" 2>/dev/null || true)"
+
+        if [ -n "$cdc_dev" ] && [ "$cur_dev" != "$cdc_dev" ]; then
+            log_info "Updating network.${iface}.device: ${cur_dev:-<empty>} -> $cdc_dev"
+            uci set "network.${iface}.device=$cdc_dev"
+            changed=1
+        fi
+        if [ -n "$qmi_node" ] && [ "$cur_node" != "$qmi_node" ]; then
+            log_info "Updating network.${iface}.node: ${cur_node:-<empty>} -> $qmi_node"
+            uci set "network.${iface}.node=$qmi_node"
+            changed=1
+        fi
+        if [ "$cur_disabled" = "1" ]; then
+            log_info "Re-enabling network.${iface} (was disabled=1)"
+            uci set "network.${iface}.disabled=0"
+            changed=1
+        fi
+        if [ "$changed" -eq 1 ]; then
+            uci commit network
+        fi
+        log_info "Reloading network and bringing up $iface..."
+        if [ -x /etc/init.d/network ]; then
+            /etc/init.d/network reload 2>/dev/null || true
+        fi
+        if command -v ifup >/dev/null 2>&1; then
+            ifup "$iface" 2>/dev/null || true
+        fi
+    else
+        log_info "No UCI network.${iface} section found; invoking gl_modem -B $bus connect-auto"
+        gl_modem -B "$bus" connect-auto >/dev/null 2>&1 || true
+    fi
+}
+
+verify_connectivity() {
+    local wwan_if="$1"
+    local elapsed=0
+    local ip_addr=""
+
+    if [ -z "$wwan_if" ]; then
+        return 1
+    fi
+
+    while [ "$elapsed" -lt "$WAIT_IP_SECS" ]; do
+        if command -v ip >/dev/null 2>&1; then
+            ip_addr="$(ip -4 addr show dev "$wwan_if" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)"
+        fi
+        if [ -n "$ip_addr" ]; then
+            log_info "Interface $wwan_if obtained IPv4: $ip_addr"
+            if command -v ping >/dev/null 2>&1; then
+                if ping -I "$wwan_if" -c 2 -W 3 1.1.1.1 >/dev/null 2>&1; then
+                    log_info "Internet connectivity verified via $wwan_if (ping 1.1.1.1 OK)"
+                    return 0
+                fi
+            fi
+            return 0
+        fi
+        "$SLEEP_CMD" 2
+        elapsed=$((elapsed + 2))
+    done
+
+    log_warn "Interface $wwan_if did not obtain an IPv4 address within ${WAIT_IP_SECS}s"
+    return 1
+}
+
+cmd_status() {
+    local bus
+    bus="$(resolve_modem_bus)"
+    local iface
+    iface="$(resolve_modem_iface "$bus")"
+    local cdc_dev=""
+    local wwan_if=""
+    cdc_dev="$(find_cdc_wdm_for_bus "$bus" 2>/dev/null || true)"
+    wwan_if="$(find_wwan_ifname "$bus" 2>/dev/null || true)"
+
+    printf '=== GL-E750 V2 EM120K Status ===\n'
+    printf 'Modem bus     : %s\n' "$bus"
+    printf 'UCI interface : %s\n' "$iface"
+    if [ -f "$SYSFS_USB/devices/$bus/idVendor" ]; then
+        printf 'USB VID:PID   : %s:%s\n' \
+            "$(cat "$SYSFS_USB/devices/$bus/idVendor" 2>/dev/null)" \
+            "$(cat "$SYSFS_USB/devices/$bus/idProduct" 2>/dev/null)"
+    fi
+    printf 'QMI control   : %s\n' "${cdc_dev:-MISSING}"
+    printf 'WWAN netdev   : %s\n' "${wwan_if:-MISSING}"
+
+    if send_at "$bus" "AT" | grep -q "OK"; then
+        printf 'Model / Rev   : %s\n' "$(send_at "$bus" 'AT+QGMR' | grep -vE '^(AT\+QGMR|OK|\s*)$' | tr -d '\r' | head -n 1)"
+        printf 'USBNet mode   : %s\n' "$(send_at "$bus" 'AT+QCFG="usbnet"' | grep '+QCFG:' | tr -d '\r' | head -n 1)"
+        printf 'CFUN state    : %s\n' "$(send_at "$bus" 'AT+CFUN?' | grep '+CFUN:' | tr -d '\r' | head -n 1)"
+        printf 'SIM state     : %s\n' "$(send_at "$bus" 'AT+CPIN?' | grep '+CPIN:' | tr -d '\r' | head -n 1)"
+        printf 'Signal (CSQ)  : %s\n' "$(send_at "$bus" 'AT+CSQ' | grep '+CSQ:' | tr -d '\r' | head -n 1)"
+        printf 'LTE Reg       : %s\n' "$(send_at "$bus" 'AT+CEREG?' | grep '+CEREG:' | tr -d '\r' | head -n 1)"
+        printf 'Operator      : %s\n' "$(send_at "$bus" 'AT+COPS?' | grep '+COPS:' | tr -d '\r' | head -n 1)"
+    else
+        printf 'AT port       : NOT RESPONDING\n'
+    fi
+
+    if [ -n "$wwan_if" ] && command -v ip >/dev/null 2>&1; then
+        local ip_addr
+        ip_addr="$(ip -4 addr show dev "$wwan_if" 2>/dev/null | awk '/inet / {print $2}' | head -n 1)"
+        printf 'WWAN IPv4     : %s\n' "${ip_addr:-NONE}"
+    fi
+}
+
+cmd_diag() {
+    local bus
+    bus="$(resolve_modem_bus)"
+    {
+        printf '=== em120k-fix diagnostic report ===\n'
+        date 2>/dev/null || true
+        cmd_status
+        printf '\n=== USB devices ===\n'
+        cat /sys/kernel/debug/usb/devices 2>/dev/null || true
+        printf '\n=== AT extended (redacted) ===\n'
+        for c in 'ATI' 'AT+QGMR' 'AT+QCFG="usbnet"' 'AT+QCFG="data_interface"' 'AT+CFUN?' 'AT+CPIN?' 'AT+CSQ' 'AT+CEREG?' 'AT+COPS?' 'AT+QENG="servingcell"' 'AT+CGDCONT?' 'AT+QMBNCFG="AutoSel"'; do
+            printf -- '--- %s ---\n' "$c"
+            send_at "$bus" "$c" | sed -E 's/[0-9]{15,20}/<REDACTED_ID>/g'
+        done
+        printf '\n=== UCI network (modem) ===\n'
+        uci show network 2>/dev/null | grep -i modem | sed -E 's/(iccid|pincode|password)=.*/\1=<REDACTED>/g' || true
+        printf '\n=== dmesg (usb/qmi/option) ===\n'
+        dmesg 2>/dev/null | grep -iE 'usb|qmi|option|wwan|cdc|2c7c' | tail -n 50 || true
+        printf '\n=== logread (modem/qmi/em120k) ===\n'
+        logread 2>/dev/null | grep -iE 'modem|qmi|uqmi|wwan|cdc|em120k' | tail -n 60 || true
+    } > "$DIAG_FILE"
+    log_info "Diagnostic report saved to $DIAG_FILE"
+}
+
+cmd_apply() {
+    if ! acquire_lock; then
+        log_info "Another em120k-fix instance is already running; exiting."
+        return 0
+    fi
+
+    local bus
+    bus="$(resolve_modem_bus)"
+    local iface
+    iface="$(resolve_modem_iface "$bus")"
+
+    log_info "Starting EM120K-GL check on bus=$bus iface=$iface"
+
+    if ! wait_for_at "$bus" "$WAIT_AT_SECS"; then
+        log_err "Modem AT interface on bus $bus did not respond within ${WAIT_AT_SECS}s"
+        return 1
+    fi
+
+    local rev=""
+    rev="$(send_at "$bus" 'AT+QGMR' | grep -vE '^(AT\+QGMR|OK|\s*)$' | tr -d '\r' | head -n 1)"
+    log_info "Detected modem firmware: ${rev:-unknown}"
+
+    ensure_usbnet_qmi "$bus" || return 1
+
+    if ! ensure_qmi_driver_bound "$bus"; then
+        log_err "QMI control device (/dev/cdc-wdm*) is still missing after switching usbnet=0"
+        return 1
+    fi
+
+    local cdc_dev=""
+    local wwan_if=""
+    local qmi_node=""
+    cdc_dev="$(find_cdc_wdm_for_bus "$bus" 2>/dev/null || true)"
+    wwan_if="$(find_wwan_ifname "$bus" 2>/dev/null || true)"
+    qmi_node="$(find_qmi_node_for_bus "$bus" 2>/dev/null || true)"
+
+    log_info "QMI ready: control=$cdc_dev netdev=$wwan_if node=$qmi_node"
+
+    ensure_rf_and_fcc_unlock "$bus" "$cdc_dev" || true
+    ensure_raw_ip "$cdc_dev" "$wwan_if"
+    reconcile_uci_and_connect "$bus" "$iface" "$cdc_dev" "$qmi_node"
+
+    if [ "${1:-}" != "--no-verify" ]; then
+        verify_connectivity "$wwan_if" || true
+    fi
+
+    return 0
+}
+
+case "${1:-apply}" in
+    apply)
+        shift || true
+        cmd_apply "$@"
+        ;;
+    status)
+        cmd_status
+        ;;
+    diag)
+        cmd_diag
+        ;;
+    -h|--help|help)
+        printf 'Usage: %s [apply|status|diag]\n' "$0"
+        ;;
+    *)
+        log_err "Unknown command: $1"
+        printf 'Usage: %s [apply|status|diag]\n' "$0"
+        exit 1
+        ;;
+esac
