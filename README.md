@@ -28,16 +28,16 @@
 
 ## Встановлення по SSH
 
-### Варіант 1: Копіювання на роутер через `scp` (працює навіть без інтернету на роутері)
-На комп'ютері, підключеному до Mudi V2 по Ethernet:
+### Варіант 1: З комп'ютера, підключеного до Mudi V2 по Ethernet (роутеру інтернет ще не потрібен)
 ```sh
-scp -O -r mudi-em120k-patch root@192.168.8.1:/tmp/
-ssh root@192.168.8.1 "sh /tmp/mudi-em120k-patch/install.sh"
+git clone https://github.com/andrandr25/mudi-v2-em120k-patch.git
+scp -O -r mudi-v2-em120k-patch root@192.168.8.1:/tmp/
+ssh root@192.168.8.1 "sh /tmp/mudi-v2-em120k-patch/install.sh"
 ```
 
-### Варіант 2: Встановлення однією командою з GitHub (якщо на роутері є тимчасовий Wi-Fi/WAN)
+### Варіант 2: Однією командою прямо на роутері (якщо на Mudi V2 є тимчасовий Wi-Fi/WAN)
 ```sh
-ssh root@192.168.8.1 "wget -qO- https://github.com/<USER>/<REPO>/archive/refs/heads/main.tar.gz | tar -xz -C /tmp && sh /tmp/<REPO>-main/install.sh"
+ssh root@192.168.8.1 "wget -qO- https://github.com/andrandr25/mudi-v2-em120k-patch/archive/refs/heads/main.tar.gz | tar -xz -C /tmp && sh /tmp/mudi-v2-em120k-patch-main/install.sh"
 ```
 
 ## Команди після встановлення
